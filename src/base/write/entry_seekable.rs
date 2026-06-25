@@ -5,7 +5,7 @@ use crate::base::write::compressed_writer::CompressedAsyncWriter;
 use crate::base::write::get_or_put_info_zip_unicode_comment_extra_field_mut;
 use crate::base::write::get_or_put_info_zip_unicode_path_extra_field_mut;
 use crate::base::write::io::offset::AsyncOffsetWriter;
-use crate::base::write::{CentralDirectoryEntry, ZipFileWriter};
+use crate::base::write::{CancellationGuard, CentralDirectoryEntry, ZipFileWriter};
 use crate::entry::ZipEntry;
 use crate::error::{Result, Zip64ErrorCase, ZipError};
 use crate::spec::consts::{NON_ZIP64_MAX_NUM_FILES, NON_ZIP64_MAX_SIZE};
@@ -20,6 +20,7 @@ use crc32fast::Hasher;
 use futures_lite::io::{AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, SeekFrom};
 use std::io::Error;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 const ZIP64_VERSION_NEEDED: u16 = 45;
@@ -48,6 +49,7 @@ pub struct EntrySeekableWriter<'b, W: AsyncWrite + AsyncSeek + Unpin> {
     force_no_zip64: bool,
     /// To write back to the original writer if Zip64 is required.
     is_zip64: &'b mut bool,
+    cancellation_guard: Option<CancellationGuard>,
 }
 
 impl<'b, W: AsyncWrite + AsyncSeek + Unpin> EntrySeekableWriter<'b, W> {
@@ -55,6 +57,7 @@ impl<'b, W: AsyncWrite + AsyncSeek + Unpin> EntrySeekableWriter<'b, W> {
         writer: &'b mut ZipFileWriter<W>,
         mut entry: ZipEntry,
     ) -> Result<EntrySeekableWriter<'b, W>> {
+        let poisoned = Arc::clone(&writer.poisoned);
         if writer.force_no_zip64 && writer.cd_entries.len() >= NON_ZIP64_MAX_NUM_FILES as usize {
             return Err(ZipError::Zip64Needed(Zip64ErrorCase::TooManyFiles));
         }
@@ -84,6 +87,7 @@ impl<'b, W: AsyncWrite + AsyncSeek + Unpin> EntrySeekableWriter<'b, W> {
             hasher: Hasher::new(),
             force_no_zip64,
             is_zip64,
+            cancellation_guard: Some(CancellationGuard::new(poisoned)),
         })
     }
 
@@ -185,6 +189,13 @@ impl<'b, W: AsyncWrite + AsyncSeek + Unpin> EntrySeekableWriter<'b, W> {
     ///
     /// Failure to call this function before going out of scope would result in a corrupted ZIP file.
     pub async fn close(mut self) -> Result<()> {
+        let guard = self.cancellation_guard.take().expect("entry writer cancellation guard missing");
+        let result = self.close_inner().await;
+        guard.complete();
+        result
+    }
+
+    async fn close_inner(mut self) -> Result<()> {
         self.writer.close().await?;
 
         let crc = self.hasher.finalize();

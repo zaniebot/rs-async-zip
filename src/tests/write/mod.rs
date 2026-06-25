@@ -530,3 +530,355 @@ fn large_central_directory_size_errors_without_zip64() {
     assert!(matches!(result, Err(ZipError::Zip64Needed(Zip64ErrorCase::LargeFile))));
     assert!(!is_zip64);
 }
+
+#[tokio::test]
+async fn cancelled_whole_entry_write_poisoned_writer_cannot_be_reused() {
+    use std::future::Future;
+
+    use futures_lite::future::poll_fn;
+
+    struct CutoffPendingWriter {
+        bytes: Vec<u8>,
+        cutoff: usize,
+        blocked: bool,
+    }
+
+    impl AsyncWrite for CutoffPendingWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+            if !self.blocked && self.bytes.len() == self.cutoff {
+                self.blocked = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let amount = if self.blocked { buf.len() } else { buf.len().min(self.cutoff - self.bytes.len()) };
+            self.bytes.extend_from_slice(&buf[..amount]);
+            Poll::Ready(Ok(amount))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let sink = CutoffPendingWriter { bytes: Vec::new(), cutoff: 4 + 26 + 1 + 2, blocked: false };
+    let mut writer = ZipFileWriter::new(sink);
+
+    let mut first = Box::pin(writer.write_entry_whole(ZipEntryBuilder::new("a".into(), Compression::Stored), b"first"));
+    let first_poll = poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx))).await;
+    assert!(first_poll.is_pending());
+    drop(first);
+
+    let retry = writer.write_entry_whole(ZipEntryBuilder::new("b".into(), Compression::Stored), b"second").await;
+    assert!(matches!(retry, Err(ZipError::WriterPoisoned)));
+}
+
+#[tokio::test]
+async fn cancelled_stream_entry_payload_poisoned_writer_cannot_be_reused() {
+    use std::future::Future;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use futures_lite::future::poll_fn;
+
+    struct CutoffPendingWriter {
+        bytes: Vec<u8>,
+        cutoff: Arc<AtomicUsize>,
+        written: Arc<AtomicUsize>,
+        blocked: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for CutoffPendingWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+            let cutoff = self.cutoff.load(Ordering::SeqCst);
+            let written = self.written.load(Ordering::SeqCst);
+            if !self.blocked.load(Ordering::SeqCst) && written == cutoff {
+                self.blocked.store(true, Ordering::SeqCst);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let amount = if self.blocked.load(Ordering::SeqCst) { buf.len() } else { buf.len().min(cutoff - written) };
+            self.bytes.extend_from_slice(&buf[..amount]);
+            self.written.fetch_add(amount, Ordering::SeqCst);
+            Poll::Ready(Ok(amount))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let cutoff = Arc::new(AtomicUsize::new(usize::MAX));
+    let written = Arc::new(AtomicUsize::new(0));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let sink = CutoffPendingWriter { bytes: Vec::new(), cutoff: cutoff.clone(), written: written.clone(), blocked };
+    let mut writer = ZipFileWriter::new(sink);
+    let mut entry = writer.write_entry_stream(ZipEntryBuilder::new("a".into(), Compression::Stored)).await.unwrap();
+    cutoff.store(written.load(Ordering::SeqCst) + 2, Ordering::SeqCst);
+
+    let mut payload = Box::pin(entry.write_all(b"first"));
+    let payload_poll = poll_fn(|cx| Poll::Ready(payload.as_mut().poll(cx))).await;
+    assert!(payload_poll.is_pending());
+    drop(payload);
+    drop(entry);
+
+    let retry = writer.write_entry_whole(ZipEntryBuilder::new("b".into(), Compression::Stored), b"second").await;
+    assert!(matches!(retry, Err(ZipError::WriterPoisoned)));
+    assert!(matches!(writer.close().await, Err(ZipError::WriterPoisoned)));
+}
+
+#[tokio::test]
+async fn cancelled_seekable_entry_payload_poisoned_writer_cannot_be_reused() {
+    use std::future::Future;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use futures_lite::future::poll_fn;
+
+    struct CutoffPendingCursor {
+        bytes: Vec<u8>,
+        position: u64,
+        cutoff: Arc<AtomicUsize>,
+        written: Arc<AtomicUsize>,
+        blocked: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for CutoffPendingCursor {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+            let cutoff = self.cutoff.load(Ordering::SeqCst);
+            let written = self.written.load(Ordering::SeqCst);
+            if !self.blocked.load(Ordering::SeqCst) && written == cutoff {
+                self.blocked.store(true, Ordering::SeqCst);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let amount = if self.blocked.load(Ordering::SeqCst) { buf.len() } else { buf.len().min(cutoff - written) };
+            let start = self.position as usize;
+            let end = start + amount;
+            if self.bytes.len() < end {
+                self.bytes.resize(end, 0);
+            }
+            self.bytes[start..end].copy_from_slice(&buf[..amount]);
+            self.position = end as u64;
+            self.written.fetch_add(amount, Ordering::SeqCst);
+            Poll::Ready(Ok(amount))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncSeek for CutoffPendingCursor {
+        fn poll_seek(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, pos: SeekFrom) -> Poll<Result<u64, Error>> {
+            let position = match pos {
+                SeekFrom::Start(position) => position,
+                SeekFrom::Current(offset) => self.position.checked_add_signed(offset).unwrap(),
+                SeekFrom::End(offset) => (self.bytes.len() as u64).checked_add_signed(offset).unwrap(),
+            };
+            self.position = position;
+            Poll::Ready(Ok(position))
+        }
+    }
+
+    let cutoff = Arc::new(AtomicUsize::new(usize::MAX));
+    let written = Arc::new(AtomicUsize::new(0));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let sink = CutoffPendingCursor {
+        bytes: Vec::new(),
+        position: 0,
+        cutoff: cutoff.clone(),
+        written: written.clone(),
+        blocked,
+    };
+    let mut writer = ZipFileWriter::new(sink);
+    let mut entry = writer.write_entry_seekable(ZipEntryBuilder::new("a".into(), Compression::Stored)).await.unwrap();
+    cutoff.store(written.load(Ordering::SeqCst) + 2, Ordering::SeqCst);
+
+    let mut payload = Box::pin(entry.write_all(b"first"));
+    let payload_poll = poll_fn(|cx| Poll::Ready(payload.as_mut().poll(cx))).await;
+    assert!(payload_poll.is_pending());
+    drop(payload);
+    drop(entry);
+
+    let retry = writer.write_entry_whole(ZipEntryBuilder::new("b".into(), Compression::Stored), b"second").await;
+    assert!(matches!(retry, Err(ZipError::WriterPoisoned)));
+    assert!(matches!(writer.close().await, Err(ZipError::WriterPoisoned)));
+}
+
+#[tokio::test]
+async fn abandoned_entry_writers_poison_parent() {
+    let mut stream_writer = ZipFileWriter::new(Vec::new());
+    let stream_entry =
+        stream_writer.write_entry_stream(ZipEntryBuilder::new("a".into(), Compression::Stored)).await.unwrap();
+    drop(stream_entry);
+
+    let retry = stream_writer.write_entry_whole(ZipEntryBuilder::new("b".into(), Compression::Stored), b"second").await;
+    assert!(matches!(retry, Err(ZipError::WriterPoisoned)));
+    assert!(matches!(stream_writer.close().await, Err(ZipError::WriterPoisoned)));
+
+    let mut seekable_writer = ZipFileWriter::new(Cursor::new(Vec::new()));
+    let seekable_entry =
+        seekable_writer.write_entry_seekable(ZipEntryBuilder::new("a".into(), Compression::Stored)).await.unwrap();
+    drop(seekable_entry);
+
+    let retry =
+        seekable_writer.write_entry_whole(ZipEntryBuilder::new("b".into(), Compression::Stored), b"second").await;
+    assert!(matches!(retry, Err(ZipError::WriterPoisoned)));
+    assert!(matches!(seekable_writer.close().await, Err(ZipError::WriterPoisoned)));
+}
+
+#[tokio::test]
+async fn cancelled_stream_entry_close_poisoned_writer_cannot_be_reused() {
+    use std::future::Future;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use futures_lite::future::poll_fn;
+
+    struct ArmedPendingWriter {
+        bytes: Vec<u8>,
+        cutoff: Arc<AtomicUsize>,
+        written: Arc<AtomicUsize>,
+        blocked: Arc<AtomicBool>,
+    }
+
+    impl AsyncWrite for ArmedPendingWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+            let cutoff = self.cutoff.load(Ordering::SeqCst);
+            let written = self.written.load(Ordering::SeqCst);
+            if !self.blocked.load(Ordering::SeqCst) && written == cutoff {
+                self.blocked.store(true, Ordering::SeqCst);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let amount = if self.blocked.load(Ordering::SeqCst) { buf.len() } else { buf.len().min(cutoff - written) };
+            self.bytes.extend_from_slice(&buf[..amount]);
+            self.written.fetch_add(amount, Ordering::SeqCst);
+            Poll::Ready(Ok(amount))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let cutoff = Arc::new(AtomicUsize::new(usize::MAX));
+    let written = Arc::new(AtomicUsize::new(0));
+    let blocked = Arc::new(AtomicBool::new(false));
+    let sink = ArmedPendingWriter { bytes: Vec::new(), cutoff: cutoff.clone(), written: written.clone(), blocked };
+    let mut writer = ZipFileWriter::new(sink);
+    let mut entry = writer.write_entry_stream(ZipEntryBuilder::new("a".into(), Compression::Stored)).await.unwrap();
+    entry.write_all(b"first").await.unwrap();
+    cutoff.store(written.load(Ordering::SeqCst) + 2, Ordering::SeqCst);
+
+    let mut close = Box::pin(entry.close());
+    let close_poll = poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx))).await;
+    assert!(close_poll.is_pending());
+    drop(close);
+
+    let retry = writer.write_entry_whole(ZipEntryBuilder::new("b".into(), Compression::Stored), b"second").await;
+    assert!(matches!(retry, Err(ZipError::WriterPoisoned)));
+}
+
+#[tokio::test]
+async fn cancelled_seekable_entry_close_poisoned_writer_cannot_be_reused() {
+    use std::future::Future;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use futures_lite::future::poll_fn;
+
+    struct ArmedPendingCursor {
+        bytes: Vec<u8>,
+        position: u64,
+        armed: Arc<AtomicBool>,
+        pending: bool,
+    }
+
+    impl AsyncWrite for ArmedPendingCursor {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+            if self.armed.load(Ordering::SeqCst) && self.pending {
+                self.armed.store(false, Ordering::SeqCst);
+                self.pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let amount = if self.armed.load(Ordering::SeqCst) { 5.min(buf.len()) } else { buf.len() };
+            let start = self.position as usize;
+            let end = start + amount;
+            if self.bytes.len() < end {
+                self.bytes.resize(end, 0);
+            }
+            self.bytes[start..end].copy_from_slice(&buf[..amount]);
+            self.position = end as u64;
+            if self.armed.load(Ordering::SeqCst) {
+                self.pending = true;
+            }
+            Poll::Ready(Ok(amount))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncSeek for ArmedPendingCursor {
+        fn poll_seek(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, pos: SeekFrom) -> Poll<Result<u64, Error>> {
+            let position = match pos {
+                SeekFrom::Start(position) => position,
+                SeekFrom::Current(offset) => self.position.checked_add_signed(offset).unwrap(),
+                SeekFrom::End(offset) => (self.bytes.len() as u64).checked_add_signed(offset).unwrap(),
+            };
+            self.position = position;
+            Poll::Ready(Ok(position))
+        }
+    }
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let sink = ArmedPendingCursor { bytes: Vec::new(), position: 0, armed: armed.clone(), pending: false };
+    let mut writer = ZipFileWriter::new(sink);
+    let mut entry = writer.write_entry_seekable(ZipEntryBuilder::new("a".into(), Compression::Stored)).await.unwrap();
+    entry.write_all(b"first").await.unwrap();
+    armed.store(true, Ordering::SeqCst);
+
+    let mut close = Box::pin(entry.close());
+    let close_poll = poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx))).await;
+    assert!(close_poll.is_pending());
+    drop(close);
+
+    let retry = writer.write_entry_whole(ZipEntryBuilder::new("b".into(), Compression::Stored), b"second").await;
+    assert!(matches!(retry, Err(ZipError::WriterPoisoned)));
+}

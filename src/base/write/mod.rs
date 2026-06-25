@@ -77,6 +77,10 @@ use io::offset::AsyncOffsetWriter;
 
 use crate::spec::consts::{NON_ZIP64_MAX_NUM_FILES, NON_ZIP64_MAX_SIZE};
 use futures_lite::io::{AsyncSeek, AsyncWrite, AsyncWriteExt};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 pub(crate) struct CentralDirectoryEntry {
     pub header: CentralDirectoryRecord,
@@ -95,6 +99,30 @@ pub struct ZipFileWriter<W> {
     /// Whether to write Zip64 end of directory structs.
     pub(crate) is_zip64: bool,
     comment_opt: Option<String>,
+    pub(crate) poisoned: Arc<AtomicBool>,
+}
+
+pub(crate) struct CancellationGuard {
+    poisoned: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    pub(crate) fn new(poisoned: Arc<AtomicBool>) -> Self {
+        Self { poisoned, armed: true }
+    }
+
+    pub(crate) fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl<W: AsyncWrite + Unpin> ZipFileWriter<W> {
@@ -106,6 +134,7 @@ impl<W: AsyncWrite + Unpin> ZipFileWriter<W> {
             comment_opt: None,
             is_zip64: false,
             force_no_zip64: false,
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -125,14 +154,20 @@ impl<W: AsyncWrite + Unpin> ZipFileWriter<W> {
 
     /// Write a new ZIP entry of known size and data.
     pub async fn write_entry_whole<E: Into<ZipEntry>>(&mut self, entry: E, data: &[u8]) -> Result<()> {
-        EntryWholeWriter::from_raw(self, entry.into(), data).write().await
+        let guard = self.cancellation_guard()?;
+        let result = EntryWholeWriter::from_raw(self, entry.into(), data).write().await;
+        guard.complete();
+        result
     }
 
     /// Write an entry of unknown size and data via streaming (ie. using a data descriptor).
     /// The generated Local File Header will be invalid, with no compressed size, uncompressed size,
     /// and a null CRC. This might cause problems with the destination reader.
     pub async fn write_entry_stream<E: Into<ZipEntry>>(&mut self, entry: E) -> Result<EntryStreamWriter<'_, W>> {
-        EntryStreamWriter::from_raw(self, entry.into()).await
+        let guard = self.cancellation_guard()?;
+        let result = EntryStreamWriter::from_raw(self, entry.into()).await;
+        guard.complete();
+        result
     }
 
     /// Write an entry of unknown size and data via streaming to a seekable output.
@@ -143,7 +178,10 @@ impl<W: AsyncWrite + Unpin> ZipFileWriter<W> {
     where
         W: AsyncSeek,
     {
-        EntrySeekableWriter::from_raw(self, entry.into()).await
+        let guard = self.cancellation_guard()?;
+        let result = EntrySeekableWriter::from_raw(self, entry.into()).await;
+        guard.complete();
+        result
     }
 
     /// Set the ZIP file comment.
@@ -167,6 +205,7 @@ impl<W: AsyncWrite + Unpin> ZipFileWriter<W> {
     ///
     /// Failure to call this function before going out of scope would result in a corrupted ZIP file.
     pub async fn close(mut self) -> Result<W> {
+        self.ensure_not_poisoned()?;
         let file_comment_length = self
             .comment_opt
             .as_ref()
@@ -253,6 +292,19 @@ impl<W: AsyncWrite + Unpin> ZipFileWriter<W> {
 
         Ok(self.writer.into_inner())
     }
+
+    fn cancellation_guard(&self) -> Result<CancellationGuard> {
+        self.ensure_not_poisoned()?;
+        Ok(CancellationGuard::new(Arc::clone(&self.poisoned)))
+    }
+
+    fn ensure_not_poisoned(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            Err(crate::error::ZipError::WriterPoisoned)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn central_directory_size_field(
@@ -284,6 +336,7 @@ where
             comment_opt: None,
             is_zip64: false,
             force_no_zip64: false,
+            poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
 }
