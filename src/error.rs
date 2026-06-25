@@ -46,6 +46,8 @@ pub enum ZipError {
     CommentTooLarge,
     #[error("filename exceeded maximum size")]
     FileNameTooLarge,
+    #[error("central directory reader cannot be reused after a cancelled read")]
+    CentralDirectoryReaderPoisoned,
     #[error("attempted to convert non-UTF8 bytes to a string/str")]
     StringNotUtf8,
 

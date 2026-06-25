@@ -1,4 +1,10 @@
 use futures_lite::io::{AsyncRead, AsyncReadExt};
+use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::task::{Context, Poll};
 
 use crate::base::read::counting::Counting;
 use crate::base::read::io::CombinedCentralDirectoryRecord;
@@ -86,6 +92,50 @@ pub struct CentralDirectoryReader<R> {
     reader: R,
     initial: bool,
     offset: u64,
+    poisoned: Arc<AtomicBool>,
+}
+
+struct TrackingReader<'a, R> {
+    reader: &'a mut Counting<R>,
+    progressed: Arc<AtomicBool>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TrackingReader<'_, R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+        match Pin::new(&mut *self.reader).poll_read(cx, buf) {
+            Poll::Ready(Ok(amount)) if amount > 0 => {
+                self.progressed.store(true, Ordering::Release);
+                Poll::Ready(Ok(amount))
+            }
+            result => result,
+        }
+    }
+}
+
+impl<R> TrackingReader<'_, R> {
+    fn bytes_read(&self) -> u64 {
+        self.reader.bytes_read()
+    }
+}
+
+struct CancellationGuard {
+    poisoned: Arc<AtomicBool>,
+    progressed: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed && self.progressed.load(Ordering::Acquire) {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl<R> CentralDirectoryReader<Counting<R>>
@@ -94,7 +144,7 @@ where
 {
     /// Constructs a new ZIP reader from a non-seekable source.
     pub fn new(reader: R, offset: u64) -> Self {
-        Self { reader: Counting::new(reader), offset, initial: true }
+        Self { reader: Counting::new(reader), offset, initial: true, poisoned: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Reads the next [`CentralDirectoryEntry`] from the underlying source, advancing the
@@ -103,31 +153,48 @@ where
     /// Returns `Ok(EndOfCentralDirectoryRecord)` if the end of the central directory record has
     /// been reached.
     pub async fn next(&mut self) -> Result<Entry> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(ZipError::CentralDirectoryReaderPoisoned);
+        }
+
+        let initial = self.initial;
+        let progressed = Arc::new(AtomicBool::new(false));
+        let guard = CancellationGuard {
+            poisoned: Arc::clone(&self.poisoned),
+            progressed: Arc::clone(&progressed),
+            armed: true,
+        };
+        let mut reader = TrackingReader { reader: &mut self.reader, progressed };
+        let result = Self::read_next(&mut reader, initial, self.offset).await;
+        self.initial = false;
+        guard.complete();
+        result
+    }
+
+    async fn read_next(reader: &mut TrackingReader<'_, R>, initial: bool, directory_offset: u64) -> Result<Entry> {
         // Skip the first `CDH_SIGNATURE`. The `CentralDirectoryReader` is assumed to pick up from
         // where the streaming `ZipFileReader` left off, which means that the first record's
         // signature has already been read.
-        if self.initial {
-            self.initial = false;
-        } else {
+        if !initial {
             let signature = {
                 let mut buffer = [0; 4];
-                self.reader.read_exact(&mut buffer).await?;
+                reader.read_exact(&mut buffer).await?;
                 u32::from_le_bytes(buffer)
             };
-            let offset = self.offset + self.reader.bytes_read();
+            let offset = directory_offset + reader.bytes_read();
             match signature {
                 CDH_SIGNATURE => (),
                 EOCDR_SIGNATURE => {
                     // Read the end-of-central-directory header.
-                    let eocdr = EndOfCentralDirectoryHeader::from_reader(&mut self.reader).await?;
+                    let eocdr = EndOfCentralDirectoryHeader::from_reader(&mut *reader).await?;
 
                     // Read the EOCDR comment.
                     let comment =
-                        io::read_string(&mut self.reader, eocdr.file_comm_length.into(), crate::StringEncoding::Utf8)
+                        io::read_string(&mut *reader, eocdr.file_comm_length.into(), crate::StringEncoding::Utf8)
                             .await?;
 
                     // Verify that the EOCDR offset matches the current reader offset.
-                    if eocdr.central_directory_offset() != self.offset {
+                    if eocdr.central_directory_offset() != directory_offset {
                         return Err(ZipError::InvalidEndOfCentralDirectoryOffset(
                             eocdr.central_directory_offset(),
                             offset,
@@ -142,20 +209,19 @@ where
                 }
                 ZIP64_EOCDR_SIGNATURE => {
                     // Read the ZIP64 EOCDR.
-                    let zip64_eocdr = Zip64EndOfCentralDirectoryRecord::from_reader(&mut self.reader).await?;
+                    let zip64_eocdr = Zip64EndOfCentralDirectoryRecord::from_reader(&mut *reader).await?;
 
                     // Skip the extensible data field.
                     let extensible = if zip64_eocdr.size_of_zip64_end_of_cd_record > 44 {
                         let extensible_data_size = zip64_eocdr.size_of_zip64_end_of_cd_record - 44;
-                        io::skip_bytes(&mut self.reader, extensible_data_size).await?;
+                        io::skip_bytes(&mut *reader, extensible_data_size).await?;
                         true
                     } else {
                         false
                     };
 
                     // Read the ZIP64 EOCDR locator.
-                    let Some(zip64_eocdl) =
-                        Zip64EndOfCentralDirectoryLocator::try_from_reader(&mut self.reader).await?
+                    let Some(zip64_eocdl) = Zip64EndOfCentralDirectoryLocator::try_from_reader(&mut *reader).await?
                     else {
                         return Err(ZipError::MissingZip64EndOfCentralDirectoryLocator);
                     };
@@ -171,7 +237,7 @@ where
                     // Read the EOCDR signature.
                     let signature = {
                         let mut buffer = [0; 4];
-                        self.reader.read_exact(&mut buffer).await?;
+                        reader.read_exact(&mut buffer).await?;
                         u32::from_le_bytes(buffer)
                     };
                     if signature != EOCDR_SIGNATURE {
@@ -179,18 +245,18 @@ where
                     }
 
                     // Read the end-of-central-directory header.
-                    let eocdr = EndOfCentralDirectoryHeader::from_reader(&mut self.reader).await?;
+                    let eocdr = EndOfCentralDirectoryHeader::from_reader(&mut *reader).await?;
 
                     // Read the EOCDR comment.
                     let comment =
-                        io::read_string(&mut self.reader, eocdr.file_comm_length.into(), crate::StringEncoding::Utf8)
+                        io::read_string(&mut *reader, eocdr.file_comm_length.into(), crate::StringEncoding::Utf8)
                             .await?;
 
                     // Combine the EOCDR and ZIP64 EOCDR.
                     let combined = CombinedCentralDirectoryRecord::combine(eocdr, zip64_eocdr);
 
                     // Verify that the EOCDR offset matches the current reader offset.
-                    if combined.central_directory_offset() != self.offset {
+                    if combined.central_directory_offset() != directory_offset {
                         return Err(ZipError::InvalidEndOfCentralDirectoryOffset(
                             combined.central_directory_offset(),
                             offset,
@@ -204,12 +270,12 @@ where
         }
 
         // Read the record.
-        let header = CentralDirectoryRecord::from_reader(&mut self.reader).await?;
+        let header = CentralDirectoryRecord::from_reader(&mut *reader).await?;
 
         // Read the file name, extra field, and comment, which also ensures that we advance the
         // reader to the next record.
-        let filename_basic = io::read_bytes(&mut self.reader, header.file_name_length.into()).await?;
-        let extra_field = io::read_bytes(&mut self.reader, header.extra_field_length.into()).await?;
+        let filename_basic = io::read_bytes(&mut *reader, header.file_name_length.into()).await?;
+        let extra_field = io::read_bytes(&mut *reader, header.extra_field_length.into()).await?;
         let extra_fields = parse_extra_fields(
             extra_field,
             header.uncompressed_size,
@@ -220,7 +286,7 @@ where
         let zip64_extra_field = get_zip64_extra_field(&extra_fields);
 
         // We read the comment but drop it, since we don't need it for anything.
-        io::skip_bytes(&mut self.reader, header.file_comment_length.into()).await?;
+        io::skip_bytes(&mut *reader, header.file_comment_length.into()).await?;
 
         // Reconcile the compressed size, uncompressed size, and file offset, using ZIP64 if necessary.
         let compressed_size = if let Some(compressed_size) = zip64_extra_field
